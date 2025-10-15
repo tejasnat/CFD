@@ -1,0 +1,276 @@
+% SIMPLE (MAC) 2D incompressible flow over a cylinder, Re=200 default
+% Cd, Cl from a RECTANGULAR control volume:
+%   F_body = ∮ [(-p I + tau)·n] dS  -  ∮ [rho * u (u·n)] dS    (steady, rho=1)
+% Includes: upwind convection, residual/Cd/Cl monitors, streamlines.
+clear; clc; close all;
+
+%% ---------------- Case controls ----------------
+U0       = 0.12;
+Re       = 10000;          % change as you like
+Nx       = 700;          % pressure cells x
+Ny       = 160;          % pressure cells y
+Lx       = 15.0;
+Ly       = 3.2;
+Dfrac    = 0.1846;       % D/Ny proportion (~0.1846)
+
+alphaU   = 0.6;
+alphaP   = 0.25;
+CFL      = 0.35;
+maxIter  = 6000;
+plotEvery= 25;
+resTol   = 2e-6;
+showVort = false;
+
+%% ---------------- Grid, fields, masks ----------------
+dx = Lx/Nx; dy = Ly/Ny;
+Dcells = round(Dfrac*Ny);
+D      = Dcells*dy;
+nu     = U0*D/Re;
+fprintf('Re=%g  U0=%.3f  nu=%.6g  dx=%.4g dy=%.4g  D=%g\n',Re,U0,nu,dx,dy,D);
+
+p = zeros(Nx,Ny);                  % cell centers
+u = U0*ones(Nx+1,Ny);              % u on vertical faces
+v = zeros(Nx,Ny+1);                % v on horizontal faces
+
+% Cylinder @ 20% Lx, mid-height
+[xc,yc] = ndgrid((0.5:1:Nx-0.5)*dx,(0.5:1:Ny-0.5)*dy);
+x0 = 0.20*Lx; y0 = 0.5*Ly; R = 0.5*D;
+cylP = (xc-x0).^2 + (yc-y0).^2 <= R^2;
+
+% Faces touching cylinder (no-slip)
+cylU=false(size(u)); cylV=false(size(v));
+cylU(2:Nx,:) = cylP(1:Nx-1,:) | cylP(2:Nx,:);
+cylV(:,2:Ny) = cylP(:,1:Ny-1) | cylP(:,2:Ny);
+
+%% ---------------- Operators ----------------
+div  = @(uu,vv) ( (uu(2:end,:)-uu(1:end-1,:))/dx + (vv(:,2:end)-vv(:,1:end-1))/dy );
+lapF = @(F) laplacian_face(F,dx,dy,true);
+gx_u = @(pp) gradp_to_u(pp,dx);
+gy_v = @(pp) gradp_to_v(pp,dy);
+Lp   = build_poisson_matrix(Nx,Ny,dx,dy);
+
+%% ---------------- Control-volume box ----------------
+nbuf = max(4, round(0.10*Dcells));   % ~10% D buffer
+ixL = max(2,    round(x0/dx) - round(Dcells/2) - nbuf);
+ixR = min(Nx-1, round(x0/dx) + round(Dcells/2) + nbuf);
+iyB = max(2,    round(y0/dy) - round(Dcells/2) - nbuf);
+iyT = min(Ny-1, round(y0/dy) + round(Dcells/2) + nbuf);
+
+%% ---------------- Monitors & figs ----------------
+resHist=[]; cdHist=[]; clHist=[];
+figField = figure('Color','w','Position',[40 80 980 420]);
+figMon   = figure('Color','w','Position',[1060 80 560 740]);
+
+%% ---------------- SIMPLE loop ----------------
+it=0; dt=0.01;
+while it < maxIter
+    it = it+1;
+
+    % BCs + cylinder no-slip
+    [u,v] = applyBC(u,v,U0); u(cylU)=0; v(cylV)=0;
+
+    % Momentum prediction (UPWIND)
+    gu=gx_u(p); gv=gy_v(p);
+    Lu=lapF(u); Lv=lapF(v);
+    Cu=conv_u_upwind(u,v,dx,dy);
+    Cv=conv_v_upwind(u,v,dx,dy);
+
+    umax = max(1e-12, max(abs(u(:))));
+    vmax = max(1e-12, max(abs(v(:))));
+    dtC  = CFL * min(dx/umax, dy/vmax);
+    dt   = 0.8*dt + 0.2*dtC;
+
+    u_star = u + dt*(-gu + nu*Lu - Cu);
+    v_star = v + dt*(-gv + nu*Lv - Cv);
+
+    u = alphaU*u_star + (1-alphaU)*u;
+    v = alphaU*v_star + (1-alphaU)*v;
+
+    [u,v] = applyBC(u,v,U0); u(cylU)=0; v(cylV)=0;
+
+    % Pressure correction
+    rhs=(1/dt)*div(u,v); rhsV=rhs(:)-mean(rhs(:));
+    pprime = reshape(Lp\rhsV, Nx,Ny);
+    p  = p + alphaP*pprime;
+    u  = u - dt*gx_u(pprime);
+    v  = v - dt*gy_v(pprime);
+    [u,v] = applyBC(u,v,U0); u(cylU)=0; v(cylV)=0;
+
+    % Residual
+    res = max(abs(div(u,v)),[],'all'); resHist(end+1)=res; %#ok<SAGROW>
+
+    % Cell-center velocities/gradients
+    uc = 0.5*(u(1:end-1,:)+u(2:end,:));   % Nx x Ny
+    vc = 0.5*(v(:,1:end-1)+v(:,2:end));   % Nx x Ny
+    [dux,duy,dvx,dvy] = grads_centered(uc,vc,dx,dy);
+    mu = nu;
+
+    % ------------- CV surface integrals -------------
+    % Convenience lambdas for stress traction t = (-p I + tau)·n
+    tx_fun = @(i,j,nx,ny) -p(i,j).*nx + (2*mu*dux(i,j)).*nx + mu*(duy(i,j)+dvx(i,j)).*ny;
+    ty_fun = @(i,j,nx,ny) -p(i,j).*ny + mu*(duy(i,j)+dvx(i,j)).*nx + (2*mu*dvy(i,j)).*ny;
+
+    % Verticals: indices j = iyB:iyT at i=ixL,ixR.  u·n uses u-faces; u vector uses [u_n, v_center]
+    jv = iyB:iyT;
+
+    % Left (n = [-1,0])  — face normal velocity u_n = u(ixL, j)
+    nx=-1; ny=0; ds=dy;
+    u_n = u(ixL, jv);              % normal speed at the left face
+    u_t = vc(ixL, jv);             % tangential approx from center
+    fxL = sum( tx_fun(ixL,jv,nx,ny) - (u_n.*(u_n)) ) * ds;     % x comp: stress_x - ρ u_x^2
+    fyL = sum( ty_fun(ixL,jv,nx,ny) - (u_n.*u_t) ) * ds;       % y comp: stress_y - ρ u_x v
+
+    % Right (n = [+1,0]) — face normal velocity u_n = u(ixR+1, j)
+    nx=+1; ny=0; ds=dy;
+    u_n = u(ixR+1, jv);            % right face
+    u_t = vc(ixR, jv);
+    fxR = sum( tx_fun(ixR,jv,nx,ny) - (u_n.*(u_n)) ) * ds;
+    fyR = sum( ty_fun(ixR,jv,nx,ny) - (u_n.*u_t) ) * ds;
+
+    % Horizontals: indices i = ixL:ixR at j=iyB,iyT.  u·n uses v-faces; u vector uses [u_center, v_n]
+    ih = ixL:ixR;
+
+    % Bottom (n = [0,-1]) — normal speed v_n = v(i,iyB)
+    nx=0; ny=-1; ds=dx;
+    v_n = v(ih, iyB);
+    u_c = uc(ih, iyB);
+    fxB = sum( tx_fun(ih,iyB,nx,ny) - (u_c.*v_n) , 'all') * ds;
+    fyB = sum( ty_fun(ih,iyB,nx,ny) - (v_n.*v_n) , 'all') * ds;
+
+    % Top (n = [0,+1])  — normal speed v_n = v(i,iyT+1)
+    nx=0; ny=+1; ds=dx;
+    v_n = v(ih, iyT+1);
+    u_c = uc(ih, iyT);
+    fxT = sum( tx_fun(ih,iyT,nx,ny) - (u_c.*v_n) , 'all') * ds;
+    fyT = sum( ty_fun(ih,iyT,nx,ny) - (v_n.*v_n) , 'all') * ds;
+
+    % Net force on body = surface stress integral - momentum flux integral (handled together above)
+    Fx = fxL + fxR + fxB + fxT;
+    Fy = fyL + fyR + fyB + fyT;
+
+    % Coefficients (rho=1)
+    q = 0.5*U0^2;  Cd = Fx/(q*D);  Cl = Fy/(q*D);
+    cdHist(end+1)=Cd; clHist(end+1)=Cl; %#ok<SAGROW>
+
+    % ---------------- Plots ----------------
+    if mod(it,plotEvery)==0 || it==1
+        W=15; resP=movmean(resHist,W); cdP=movmean(cdHist,W); clP=movmean(clHist,W);
+
+        % Field + streamlines
+        figure(figField); clf;
+        if ~showVort
+            imagesc(hypot(uc,vc)'); axis equal tight; set(gca,'YDir','normal');
+            try colormap(turbo); catch, colormap(parula); end
+            caxis([0,1.6*U0]); colorbar; hold on;
+        else
+            dvdx=(vc([2:end 1],:)-vc([end 1:end-1],:))/dx;
+            dudy=(uc(:,[2:end 1])-uc(:,[end 1:end-1]))/dy;
+            imagesc((dvdx-dudy)'); axis equal tight; set(gca,'YDir','normal');
+            try colormap(turbo); catch, colormap(parula); end
+            colorbar; hold on;
+        end
+        contour(cylP',[1 1],'k','LineWidth',1.2);
+        rectangle('Position',[ixL*dx,iyB*dy,(ixR-ixL)*dx,(iyT-iyB)*dy],...
+                  'EdgeColor',[.8 .2 .2],'LineWidth',1.1);
+
+        step=3; xs=1:step:Nx; ys=1:step:Ny; [Xc,Yc]=meshgrid(xs,ys);
+        hs = streamslice(Xc,Yc, uc(xs,ys)', vc(xs,ys)', 2);
+        if ~isempty(hs), set(hs,'Color',[0 0 0],'LineWidth',0.8); end
+        title(sprintf('it=%d  max|div|=%.2e  Cd=%.3f  Cl=%.3f',it,res,Cd,Cl), 'FontWeight','bold');
+        box on; drawnow;
+
+        % Monitors
+        figure(figMon); clf;
+        subplot(3,1,1); semilogy(resP,'-'); grid on;
+        ylabel('max|div u|'); title('Residual vs Iterations'); yline(resTol,'--','tol'); xlabel('Iteration');
+        subplot(3,1,2); plot(cdP,'-'); grid on; ylabel('C_d'); xlabel('Iteration'); title('Drag coefficient vs Iterations');
+        subplot(3,1,3); plot(clP,'-'); grid on; ylabel('C_l'); xlabel('Iteration'); title('Lift coefficient vs Iterations');
+        drawnow;
+    end
+end
+
+%% ================= Local functions =================
+function [u,v] = applyBC(u,v,U0)
+    u(1,:)   = U0;             % inlet
+    u(end,:) = u(end-1,:);     % outlet du/dx ≈ 0
+    v(1,:)   = v(2,:);
+    v(end,:) = v(end-1,:);
+end
+
+function L = laplacian_face(F,dx,dy,periodicY)
+    Fl=[F(1,:);F(1:end-1,:)]; Fr=[F(2:end,:);F(end,:)];
+    d2x=(Fl-2*F+Fr)/dx^2;
+    if periodicY, Fu=F(:,[2:end 1]); Fd=F(:,[end 1:end-1]);
+    else, Fu=[F(:,2:end) F(:,end)]; Fd=[F(:,1) F(:,1:end-1)]; end
+    d2y=(Fu-2*F+Fd)/dy^2; L=d2x+d2y;
+end
+
+function gu = gradp_to_u(p,dx)
+    [Nx,Ny]=size(p); gu=zeros(Nx+1,Ny);
+    gu(2:Nx,:)=(p(2:Nx,:)-p(1:Nx-1,:))/dx;
+end
+
+function gv = gradp_to_v(p,dy)
+    [Nx,Ny]=size(p); gv=zeros(Nx,Ny+1);
+    gv(:,2:Ny)=(p(:,2:Ny)-p(:,1:Ny-1))/dy;
+end
+
+function [dux,duy,dvx,dvy] = grads_centered(uc,vc,dx,dy)
+    ucL=[uc(1,:);uc(1:end-1,:)]; ucR=[uc(2:end,:);uc(end,:)];
+    vcL=[vc(1,:);vc(1:end-1,:)]; vcR=[vc(2:end,:);vc(end,:)];
+    dux=(ucR-ucL)/(2*dx); dvx=(vcR-vcL)/(2*dx);
+    ucU=uc(:,[2:end 1]); ucD=uc(:,[end 1:end-1]);
+    vcU=vc(:,[2:end 1]); vcD=vc(:,[end 1:end-1]);
+    duy=(ucU-ucD)/(2*dy); dvy=(vcU-vcD)/(2*dy);
+end
+
+% ---- Upwind convection terms on faces ----
+function Cu = conv_u_upwind(u,v,dx,dy)
+    [Nx1,Ny]=size(u); Nx=Nx1-1; Cu=zeros(Nx+1,Ny);
+    for i=2:Nx
+        ui=u(i,:); uim1=u(i-1,:); uip1=u(i+1,:);
+        up=u(i,:); dudx=(up>0).*(ui-uim1)/dx + (up<=0).*(uip1-ui)/dx;
+        Cu(i,:)=Cu(i,:)+up.*dudx;
+    end
+    vjc=0.5*(v(:,1:Ny)+v(:,2:Ny+1)); vU=zeros(Nx+1,Ny);
+    vU(2:Nx,:)=0.5*(vjc(1:Nx-1,:)+vjc(2:Nx,:)); vU(1,:)=vjc(1,:); vU(end,:)=vjc(end,:);
+    for j=2:Ny-1
+        uj=u(:,j); ujm1=u(:,j-1); ujp1=u(:,j+1); vp=vU(:,j);
+        dudy=(vp>0).*(uj-ujm1)/dy + (vp<=0).*(ujp1-uj)/dy;
+        Cu(:,j)=Cu(:,j)+vp.*dudy;
+    end
+end
+
+function Cv = conv_v_upwind(u,v,dx,dy)
+    [Nx,Ny1]=size(v); Ny=Ny1-1; Cv=zeros(Nx,Ny+1);
+    uic=0.5*(u(1:Nx,:)+u(2:Nx+1,:)); uV=zeros(Nx,Ny+1);
+    uV(:,2:Ny)=0.5*(uic(:,1:Ny-1)+uic(:,2:Ny)); uV(:,1)=uic(:,1); uV(:,end)=uic(:,end);
+    for i=2:Nx-1
+        vi=v(i,:); vim1=v(i-1,:); vip1=v(i+1,:); up=uV(i,:);
+        dvdx=(up>0).*(vi-vim1)/dx + (up<=0).*(vip1-vi)/dx;
+        Cv(i,:)=Cv(i,:)+up.*dvdx;
+    end
+    for j=2:Ny
+        vj=v(:,j); vjm1=v(:,j-1); vjp1=v(:,j+1); vp=v(:,j);
+        dvdy=(vp>0).*(vj-vjm1)/dy + (vp<=0).*(vjp1-vj)/dy;
+        Cv(:,j)=Cv(:,j)+vp.*dvdy;
+    end
+end
+
+function Lp = build_poisson_matrix(Nx,Ny,dx,dy)
+    N=Nx*Ny; ii=[]; jj=[]; ss=[]; idx=@(i,j) (j-1)*Nx + i;
+    for j=1:Ny
+        jm=(j==1)*Ny + (j>1)*(j-1);
+        jp=(j==Ny)*1  + (j<Ny)*(j+1);
+        for i=1:Nx
+            k=idx(i,j);
+            ii(end+1)=k; jj(end+1)=k; ss(end+1)=-2/dx^2-2/dy^2;
+            il=max(i-1,1); ir=min(i+1,Nx);
+            ii(end+1)=k; jj(end+1)=idx(il,j); ss(end+1)=1/dx^2;
+            ii(end+1)=k; jj(end+1)=idx(ir,j); ss(end+1)=1/dx^2;
+            ii(end+1)=k; jj(end+1)=idx(i,jm); ss(end+1)=1/dy^2;
+            ii(end+1)=k; jj(end+1)=idx(i,jp); ss(end+1)=1/dy^2;
+        end
+    end
+    Lp = sparse(ii,jj,ss,N,N);
+end
